@@ -4,6 +4,7 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
+import asyncio
 import json
 import unittest
 
@@ -255,3 +256,40 @@ async def test_soniox_run_tts_configures_a_stream_it_has_not_opened():
     assert [m.get("stream_id") for m in sent] == ["stream-1"] * 3
     assert "text" not in sent[0]
     assert [m.get("text") for m in sent[1:]] == ["Hello.", "Again."]
+
+
+async def _keepalive_sleeps(monkeypatch, service, ticks=3):
+    """Run the keepalive loop for ``ticks`` sleeps; return the sleep durations."""
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds):
+        if len(sleeps) == ticks:
+            raise asyncio.CancelledError
+        sleeps.append(seconds)
+
+    monkeypatch.setattr("pipecat.services.soniox.tts.asyncio.sleep", fake_sleep)
+    with pytest.raises(asyncio.CancelledError):
+        await service._keepalive_task_handler()
+    return sleeps
+
+
+@pytest.mark.asyncio
+async def test_soniox_keepalive_runs_on_the_configured_interval(monkeypatch):
+    service = SonioxTTSService(api_key="test-key", keepalive_interval=3.0)
+    service._websocket = _FakeWebsocket()
+
+    sleeps = await _keepalive_sleeps(monkeypatch, service)
+
+    assert sleeps == [3.0, 3.0, 3.0]
+    assert service._websocket.sent == [{"keep_alive": True}] * 3
+
+
+@pytest.mark.asyncio
+async def test_soniox_keepalive_default_fires_before_the_observed_idle_close(monkeypatch):
+    # Soniox's EU endpoint idle-closes after about 11s.
+    service = SonioxTTSService(api_key="test-key")
+    service._websocket = _FakeWebsocket()
+
+    sleeps = await _keepalive_sleeps(monkeypatch, service, ticks=1)
+
+    assert sleeps[0] < 11

@@ -1,0 +1,1 @@
+- Fixed `SonioxTTSService` losing its connection to idle closes: its keepalive fired every 20s, but Soniox's EU endpoint closes idle sockets after about 11s. Keepalives now go out every 8s, configurable with the new `keepalive_interval` constructor argument.

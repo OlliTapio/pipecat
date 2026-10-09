@@ -40,8 +40,8 @@ from pipecat.transcriptions.language import Language, resolve_language
 from pipecat.utils.tracing.service_decorators import traced_tts
 from pipecat.utils.types import NOT_GIVEN, NotGiven
 
-# Soniox idle timeout is 20-30s; keepalive cadence must stay well inside it.
-KEEPALIVE_INTERVAL_SECONDS = 20
+# Soniox documents a 20-30s idle timeout, but its EU endpoint closes idle sockets after ~11s.
+KEEPALIVE_INTERVAL_SECONDS = 8
 
 # Soniox-supported sample rates for raw PCM formats
 VALID_SAMPLE_RATES = {8000, 16000, 24000, 44100, 48000}
@@ -175,6 +175,7 @@ class SonioxTTSService(WebsocketTTSService):
         audio_format: str = "pcm_s16le",
         settings: Settings | None = None,
         text_aggregation_mode: TextAggregationMode | None = None,
+        keepalive_interval: float = KEEPALIVE_INTERVAL_SECONDS,
         **kwargs,
     ):
         """Initialize the Soniox TTS service.
@@ -192,6 +193,8 @@ class SonioxTTSService(WebsocketTTSService):
                 deprecated parameters, ``settings`` values take precedence.
             text_aggregation_mode: How to aggregate incoming text before
                 synthesis. Defaults to ``TextAggregationMode.SENTENCE``.
+            keepalive_interval: Seconds between keepalive messages on an idle
+                connection. Must stay below Soniox's idle timeout.
             **kwargs: Additional arguments passed to the parent service.
         """
         # Initialize default_settings
@@ -225,6 +228,7 @@ class SonioxTTSService(WebsocketTTSService):
 
         self._api_key = api_key
         self._url = url
+        self._keepalive_interval = keepalive_interval
 
         # Init-only audio format (not runtime-updatable).
         self._audio_format = audio_format
@@ -500,11 +504,11 @@ class SonioxTTSService(WebsocketTTSService):
     async def _keepalive_task_handler(self):
         """Send periodic keepalive messages to prevent Soniox's idle timeout.
 
-        Soniox closes idle connections after 20-30s; sending ``{"keep_alive": true}``
-        resets the timer without triggering synthesis.
+        Sending ``{"keep_alive": true}`` resets Soniox's idle timer without
+        triggering synthesis.
         """
         while True:
-            await asyncio.sleep(KEEPALIVE_INTERVAL_SECONDS)
+            await asyncio.sleep(self._keepalive_interval)
             try:
                 if self._websocket and self._websocket.state is State.OPEN:
                     await self._websocket.send(json.dumps({"keep_alive": True}))
