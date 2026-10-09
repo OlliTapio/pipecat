@@ -735,7 +735,7 @@ class LLMUserAggregator(LLMContextAggregator):
         self._user_turn_interrupted_bot = False
         self._consecutive_empty_user_turn_recoveries = 0
 
-        self._queued_frame_task: asyncio.Task | None = None
+        self._process_queue_task: asyncio.Task | None = None
 
         self._user_turn_controller = UserTurnController(
             user_turn_strategies=user_turn_strategies,
@@ -824,7 +824,7 @@ class LLMUserAggregator(LLMContextAggregator):
         await super().process_frame(frame, direction)
 
         if not isinstance(frame, SystemFrame):
-            self._queued_frame_task = asyncio.current_task()
+            self._process_queue_task = asyncio.current_task()
 
         if await self._maybe_mute_frame(frame):
             return
@@ -1372,8 +1372,9 @@ class LLMUserAggregator(LLMContextAggregator):
         await self._call_event_handler("on_user_turn_started", strategy)
 
     async def _interrupt_for_user_turn(self):
-        if asyncio.current_task() is self._queued_frame_task:
+        if asyncio.current_task() is self._process_queue_task:
             # Frames queued behind the turn-opening frame arrived after it and belong to the turn.
+            logger.debug(f"{self}: broadcasting interruption, keeping queued frames")
             await self.stop_all_metrics()
             await self.broadcast_frame(InterruptionFrame)
         else:

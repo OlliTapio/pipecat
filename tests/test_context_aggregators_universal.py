@@ -110,7 +110,7 @@ class SlowFrame(ControlFrame):
 class SlowUserAggregator(LLMUserAggregator):
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         if isinstance(frame, SlowFrame):
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.3)
             return
         await super().process_frame(frame, direction)
 
@@ -564,7 +564,7 @@ class TestLLMUserAggregator(unittest.IsolatedAsyncioTestCase):
             SlowFrame(),
             TranscriptionFrame(text="Ja.", user_id="", timestamp="now", finalized=True),
             TranscriptionFrame(text="Kiitos.", user_id="", timestamp="now", finalized=True),
-            SleepFrame(sleep=0.5),
+            SleepFrame(sleep=0.8),
         ]
         await run_test(
             Pipeline([user_aggregator]),
@@ -594,7 +594,7 @@ class TestLLMUserAggregator(unittest.IsolatedAsyncioTestCase):
             ProposedUserStoppedSpeakingFrame(),
             SleepFrame(sleep=0.03),
             ProposedUserStartedSpeakingFrame(),
-            SleepFrame(sleep=0.3),
+            SleepFrame(sleep=0.6),
         ]
         expected_down_frames = [UserStartedSpeakingFrame, InterruptionFrame]
         await run_test(
