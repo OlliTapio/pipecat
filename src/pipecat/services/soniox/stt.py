@@ -735,7 +735,7 @@ class SonioxSTTService(WebsocketSTTService):
                     )
                     interim_text = final_text + non_final_text
 
-                    # Soniox repeats the buffered text in messages that carry no new tokens.
+                    # A repeated interim would re-arm user_turn_stop_timeout.
                     if interim_text != last_interim_text:
                         last_interim_text = interim_text
                         await self.push_frame(
