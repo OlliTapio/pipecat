@@ -491,6 +491,46 @@ class TestLLMUserAggregator(unittest.IsolatedAsyncioTestCase):
             expected_down_frames=expected_down_frames,
         )
 
+    async def test_turn_opened_by_a_transcript_closes_on_the_stop_proposed_behind_it(self):
+        """The interruption a transcript-opened turn fires keeps the stop queued behind it.
+
+        The stop strategy's timer is set far longer than the test runs, so the
+        turn can only close on the proposal.
+        """
+        context = LLMContext()
+        user_aggregator = LLMUserAggregator(
+            context,
+            params=LLMUserAggregatorParams(
+                user_turn_strategies=UserTurnStrategies(
+                    start=[TranscriptionUserTurnStartStrategy()],
+                    stop=[ExternalUserTurnStopStrategy(timeout=30.0)],
+                ),
+                user_turn_stop_timeout=30.0,
+            ),
+        )
+
+        frames_to_send = [
+            ProposedUserStartedSpeakingFrame(),
+            TranscriptionFrame(text="Ja.", user_id="", timestamp="now", finalized=True),
+            ProposedUserStoppedSpeakingFrame(),
+            SleepFrame(sleep=0.3),
+        ]
+        expected_down_frames = [
+            ProposedUserStartedSpeakingFrame,
+            UserStartedSpeakingFrame,
+            InterruptionFrame,
+            LLMContextFrame,
+            UserStoppedSpeakingFrame,
+        ]
+        await run_test(
+            Pipeline([user_aggregator]),
+            frames_to_send=frames_to_send,
+            expected_down_frames=expected_down_frames,
+        )
+        self.assertEqual(
+            [m["content"] for m in context.get_messages() if m["role"] == "user"], ["Ja."]
+        )
+
     async def test_proposed_frames_go_unresolved_while_the_user_is_muted(self):
         """Muting gates the proposal, so no turn is decided from it."""
         context = LLMContext()

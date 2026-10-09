@@ -1,0 +1,1 @@
+- Fixed a user turn that never ended when a transcript opened it: the interruption the turn fired discarded the `ProposedUserStoppedSpeakingFrame` queued behind that transcript. The frame is now uninterruptible.
