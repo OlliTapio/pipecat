@@ -663,8 +663,11 @@ class SonioxSTTService(WebsocketSTTService):
         """
         # Transcription frame will be only sent after we get the "endpoint" event.
         self._final_transcription_buffer = []
+        last_interim_text = None
 
         async def send_endpoint_transcript():
+            nonlocal last_interim_text
+            last_interim_text = None
             if self._final_transcription_buffer:
                 text = "".join(map(lambda token: token["text"], self._final_transcription_buffer))
                 language = _language_from_tokens(self._final_transcription_buffer)
@@ -730,17 +733,21 @@ class SonioxSTTService(WebsocketSTTService):
                     non_final_text = "".join(
                         map(lambda token: token["text"], non_final_transcription)
                     )
+                    interim_text = final_text + non_final_text
 
-                    await self.push_frame(
-                        InterimTranscriptionFrame(
-                            # Even final tokens are sent as interim tokens as we want to send
-                            # nicely formatted messages - therefore waiting for the endpoint.
-                            text=final_text + non_final_text,
-                            user_id=self._user_id,
-                            timestamp=time_now_iso8601(),
-                            result=self._final_transcription_buffer + non_final_transcription,
+                    # Soniox repeats the buffered text in messages that carry no new tokens.
+                    if interim_text != last_interim_text:
+                        last_interim_text = interim_text
+                        await self.push_frame(
+                            InterimTranscriptionFrame(
+                                # Even final tokens are sent as interim tokens as we want to send
+                                # nicely formatted messages - therefore waiting for the endpoint.
+                                text=interim_text,
+                                user_id=self._user_id,
+                                timestamp=time_now_iso8601(),
+                                result=self._final_transcription_buffer + non_final_transcription,
+                            )
                         )
-                    )
 
                 error_code = content.get("error_code")
                 error_message = content.get("error_message")

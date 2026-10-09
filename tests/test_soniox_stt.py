@@ -591,3 +591,58 @@ async def test_stop_completes_teardown_when_the_end_of_audio_send_fails():
     service._flush_stt_usage_metrics.assert_awaited_once()
     assert service._disconnecting is True
     assert websocket.closed
+
+
+@pytest.mark.asyncio
+async def test_receive_messages_pushes_an_interim_only_when_the_text_changes(monkeypatch):
+    service = SonioxSTTService(api_key="test-key")
+    pushed_frames = []
+
+    async def fake_push_frame(frame, direction=None):
+        pushed_frames.append(frame)
+
+    messages = [
+        json.dumps({"tokens": [{"text": "Rikki", "is_final": True}]}),
+        json.dumps({"tokens": []}),
+        json.dumps({"tokens": []}),
+        json.dumps({"tokens": [{"text": " on", "is_final": False}]}),
+        json.dumps({"tokens": [{"text": " on", "is_final": False}]}),
+    ]
+    service._websocket = _FakeWebsocket(messages)
+    monkeypatch.setattr(service, "push_frame", fake_push_frame)
+
+    await service._receive_messages()
+
+    interims = [f.text for f in pushed_frames if isinstance(f, InterimTranscriptionFrame)]
+    assert interims == ["Rikki", "Rikki on"]
+
+
+@pytest.mark.asyncio
+async def test_receive_messages_pushes_a_repeated_interim_after_a_final_transcript(monkeypatch):
+    service = SonioxSTTService(api_key="test-key")
+    pushed_frames = []
+
+    async def fake_push_frame(frame, direction=None):
+        pushed_frames.append(frame)
+
+    async def fake_handle_transcription(*args, **kwargs):
+        pass
+
+    messages = [
+        json.dumps({"tokens": [{"text": "Ja", "is_final": False}]}),
+        json.dumps(
+            {"tokens": [{"text": "Ja", "is_final": True}, {"text": END_TOKEN, "is_final": True}]}
+        ),
+        json.dumps({"tokens": [{"text": "Ja", "is_final": False}]}),
+    ]
+    service._websocket = _FakeWebsocket(messages)
+    monkeypatch.setattr(service, "push_frame", fake_push_frame)
+    monkeypatch.setattr(service, "_handle_transcription", fake_handle_transcription)
+
+    await service._receive_messages()
+
+    assert [(type(f).__name__, f.text) for f in pushed_frames] == [
+        ("InterimTranscriptionFrame", "Ja"),
+        ("TranscriptionFrame", "Ja"),
+        ("InterimTranscriptionFrame", "Ja"),
+    ]

@@ -1,0 +1,1 @@
+- Fixed `SonioxSTTService` pushing an identical `InterimTranscriptionFrame` for every message that carried no new tokens. The repeats kept re-arming `user_turn_stop_timeout`, so a turn without a final transcript never timed out.
