@@ -1,1 +1,1 @@
-- Fixed a user turn that never ended when a transcript opened it: the interruption the turn fired discarded the `ProposedUserStoppedSpeakingFrame` queued behind that transcript. The frame is now uninterruptible.
+- Fixed a user turn that never ended when a transcript opened it: the interruption the turn fired discarded the `ProposedUserStoppedSpeakingFrame` queued behind that transcript. `LLMUserAggregator` now keeps the frames queued behind a turn-opening transcript (or any other non-system frame), so that stop proposal and any further transcripts join the turn.

@@ -1401,12 +1401,9 @@ class ProposedUserStoppedSpeakingFrame(ControlFrame):
     :class:`TranscriptionFrame`. A service with its own turn detection pushes
     that transcript and then proposes the stop, and the turn strategy needs
     that text in hand to close the turn on.
-
-    It is uninterruptible because the turn its transcript opens interrupts,
-    and no later proposal replaces the one that interruption would discard.
     """
 
-    interruptible: bool = field(default=False, init=False)
+    pass
 
 
 @dataclass
