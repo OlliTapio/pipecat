@@ -17,6 +17,7 @@ from pipecat.frames.frames import (
     Frame,
     InterruptionFrame,
     OutputTransportMessageUrgentFrame,
+    ProposedUserStoppedSpeakingFrame,
     StartFrame,
     StopFrame,
     SystemFrame,
@@ -224,6 +225,30 @@ class TestFrameProcessor(unittest.IsolatedAsyncioTestCase):
             expected_down_frames=expected_down_frames,
         )
         self.assertEqual([f.text for f in received if isinstance(f, TextFrame)], ["kept"])
+
+    async def test_queued_proposed_user_stopped_speaking_survives_interruption(self):
+        """A queued proposed stop survives an interruption, so the turn its start opened can end."""
+
+        class DelayTestFrameProcessor(FrameProcessor):
+            async def process_frame(self, frame: Frame, direction: FrameDirection):
+                await super().process_frame(frame, direction)
+                if not isinstance(frame, SystemFrame):
+                    await asyncio.sleep(0.4)
+                await self.push_frame(frame, direction)
+
+        pipeline = Pipeline([DelayTestFrameProcessor()])
+        frames_to_send = [
+            TextFrame(text="in progress"),
+            ProposedUserStoppedSpeakingFrame(),
+            SleepFrame(),
+            InterruptionFrame(),
+        ]
+        expected_down_frames = [InterruptionFrame, ProposedUserStoppedSpeakingFrame]
+        await run_test(
+            pipeline,
+            frames_to_send=frames_to_send,
+            expected_down_frames=expected_down_frames,
+        )
 
     async def test_broadcast_frame(self):
         """Test that broadcast_frame creates two separate frames with fresh IDs."""
