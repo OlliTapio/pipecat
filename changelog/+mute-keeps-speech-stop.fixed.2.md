@@ -1,0 +1,1 @@
+- Fixed an interruption flushing a queued `ProposedUserStoppedSpeakingFrame`, which left the turn its start opened with no stop. The frame is now uninterruptible.
