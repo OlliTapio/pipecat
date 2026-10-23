@@ -751,6 +751,7 @@ class LLMUserAggregator(LLMContextAggregator):
             self._disable_empty_user_turn_recovery()
 
         self._user_is_muted = False
+        self._vad_speech_started_unmuted = False
         self._user_turn_start_timestamp = ""
         # One-shot guard: whether the first realtime LLM service metadata frame
         # has been handled this session — see _handle_llm_service_metadata.
@@ -1285,6 +1286,13 @@ class LLMUserAggregator(LLMContextAggregator):
                 UserBackchannelFrame,
             ),
         )
+
+        if isinstance(frame, VADUserStartedSpeakingFrame):
+            self._vad_speech_started_unmuted = not should_mute_frame
+        elif isinstance(frame, VADUserStoppedSpeakingFrame):
+            # Dropping the end of speech that began unmuted leaves the turn stuck open.
+            should_mute_frame = should_mute_frame and not self._vad_speech_started_unmuted
+            self._vad_speech_started_unmuted = False
 
         if should_mute_frame:
             logger.trace(f"{frame.name} suppressed - user currently muted")
