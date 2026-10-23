@@ -124,6 +124,12 @@ from pipecat.utils.string import TextPartForConcatenation, concatenate_aggregate
 from pipecat.utils.text.base_text_aggregator import TextType
 from pipecat.utils.time import time_now_iso8601
 
+_SPEECH_START_STOP_PAIRS = (
+    (VADUserStartedSpeakingFrame, VADUserStoppedSpeakingFrame),
+    (ProposedUserStartedSpeakingFrame, ProposedUserStoppedSpeakingFrame),
+    (UserStartedSpeakingFrame, UserStoppedSpeakingFrame),
+)
+
 
 @dataclass
 class LLMUserAggregatorParams:
@@ -751,7 +757,7 @@ class LLMUserAggregator(LLMContextAggregator):
             self._disable_empty_user_turn_recovery()
 
         self._user_is_muted = False
-        self._vad_speech_started_unmuted = False
+        self._unmuted_speech_stops_owed: set[type[Frame]] = set()
         self._user_turn_start_timestamp = ""
         # One-shot guard: whether the first realtime LLM service metadata frame
         # has been handled this session — see _handle_llm_service_metadata.
@@ -1287,12 +1293,16 @@ class LLMUserAggregator(LLMContextAggregator):
             ),
         )
 
-        if isinstance(frame, VADUserStartedSpeakingFrame):
-            self._vad_speech_started_unmuted = not should_mute_frame
-        elif isinstance(frame, VADUserStoppedSpeakingFrame):
-            # Dropping the end of speech that began unmuted leaves the turn stuck open.
-            should_mute_frame = should_mute_frame and not self._vad_speech_started_unmuted
-            self._vad_speech_started_unmuted = False
+        for start_type, stop_type in _SPEECH_START_STOP_PAIRS:
+            if isinstance(frame, start_type):
+                if should_mute_frame:
+                    self._unmuted_speech_stops_owed.discard(stop_type)
+                else:
+                    self._unmuted_speech_stops_owed.add(stop_type)
+            elif isinstance(frame, stop_type) and stop_type in self._unmuted_speech_stops_owed:
+                # Dropping the end of speech that began unmuted leaves the turn stuck open.
+                should_mute_frame = False
+                self._unmuted_speech_stops_owed.discard(stop_type)
 
         if should_mute_frame:
             logger.trace(f"{frame.name} suppressed - user currently muted")
