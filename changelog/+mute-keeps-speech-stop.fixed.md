@@ -1,0 +1,1 @@
+- Fixed a user turn staying open after a mute ended, such as `FunctionCallUserMuteStrategy` muting while the user was still speaking. `LLMUserAggregator` now lets a `VADUserStoppedSpeakingFrame`, `ProposedUserStoppedSpeakingFrame` or `UserStoppedSpeakingFrame` through a mute when its matching start passed unmuted.
