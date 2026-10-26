@@ -120,6 +120,14 @@ from pipecat.utils.deprecation import warn_deprecated
 from pipecat.utils.string import TextPartForConcatenation, concatenate_aggregated_text
 from pipecat.utils.time import time_now_iso8601
 
+# Start/stop frames that open and close a span of user speech. Muting tracks
+# them as pairs so a mute never strands a span it didn't suppress the start of.
+_USER_SPEAKING_FRAME_PAIRS: tuple[tuple[type[Frame], type[Frame]], ...] = (
+    (VADUserStartedSpeakingFrame, VADUserStoppedSpeakingFrame),
+    (UserStartedSpeakingFrame, UserStoppedSpeakingFrame),
+    (ProposedUserStartedSpeakingFrame, ProposedUserStoppedSpeakingFrame),
+)
+
 
 @dataclass
 class LLMUserAggregatorParams:
@@ -706,6 +714,8 @@ class LLMUserAggregator(LLMContextAggregator):
             self._disable_empty_user_turn_recovery()
 
         self._user_is_muted = False
+        # Stop frame classes whose matching start was let through unmuted.
+        self._unmuted_speaking_starts: set[type[Frame]] = set()
         self._user_turn_start_timestamp = ""
         # One-shot guard: whether the first realtime LLM service metadata frame
         # has been handled this session — see _handle_llm_service_metadata.
@@ -1230,6 +1240,16 @@ class LLMUserAggregator(LLMContextAggregator):
                 EagerTranscriptionFrame,
             ),
         )
+
+        # A stop whose start got through before the mute is never suppressed:
+        # the turn controller and everything downstream already saw the user
+        # start speaking, and would otherwise wait for a stop that never comes.
+        for start_cls, stop_cls in _USER_SPEAKING_FRAME_PAIRS:
+            if isinstance(frame, stop_cls) and stop_cls in self._unmuted_speaking_starts:
+                should_mute_frame = False
+                self._unmuted_speaking_starts.discard(stop_cls)
+            elif isinstance(frame, start_cls) and not should_mute_frame:
+                self._unmuted_speaking_starts.add(stop_cls)
 
         if should_mute_frame:
             logger.trace(f"{frame.name} suppressed - user currently muted")
