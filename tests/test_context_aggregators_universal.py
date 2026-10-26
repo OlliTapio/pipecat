@@ -7,6 +7,7 @@
 import io
 import json
 import unittest
+from dataclasses import dataclass
 
 from loguru import logger
 
@@ -47,6 +48,7 @@ from pipecat.frames.frames import (
     SpeechControlParamsFrame,
     StartFrame,
     STTMetadataFrame,
+    SystemFrame,
     TextFrame,
     TranscriptionFrame,
     TranslationFrame,
@@ -77,6 +79,7 @@ from pipecat.processors.aggregators.llm_response_universal import (
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.tests.utils import SleepFrame, run_test
 from pipecat.turns.empty_user_turn import EmptyUserTurnConfig
+from pipecat.turns.types import ProcessFrameResult, UserTurnSpeculation
 from pipecat.turns.user_mute import (
     FirstSpeechUserMuteStrategy,
     FunctionCallUserMuteStrategy,
@@ -88,6 +91,7 @@ from pipecat.turns.user_start import (
     VADUserTurnStartStrategy,
 )
 from pipecat.turns.user_stop import (
+    BaseUserTurnStopStrategy,
     ExternalUserTurnStopStrategy,
     SpeechTimeoutUserTurnStopStrategy,
 )
@@ -117,6 +121,33 @@ class _NonZeroVADAnalyzer(VADAnalyzer):
 
     def voice_confidence(self, buffer: bytes) -> float:
         return 1.0 if any(buffer) else 0.0
+
+
+@dataclass
+class _TurnStopCommandFrame(SystemFrame):
+    """Tells :class:`_ScriptedUserTurnStopStrategy` which turn stop event to fire."""
+
+    action: str
+    text: str = ""
+
+
+class _ScriptedUserTurnStopStrategy(BaseUserTurnStopStrategy):
+    """Stop strategy that fires the turn stop events a test asks for, when it asks."""
+
+    async def process_frame(self, frame: Frame) -> ProcessFrameResult:
+        if not isinstance(frame, _TurnStopCommandFrame):
+            return ProcessFrameResult.CONTINUE
+        if frame.action == "inference":
+            await self.trigger_user_turn_inference_triggered()
+        elif frame.action == "speculate":
+            await self.trigger_user_turn_inference_triggered(
+                speculation=UserTurnSpeculation(text=frame.text)
+            )
+        elif frame.action == "finalize":
+            await self.trigger_user_turn_finalized()
+        elif frame.action == "confirm":
+            await self.trigger_user_turn_finalized(confirms_speculation=True)
+        return ProcessFrameResult.CONTINUE
 
 
 def _audio_frames(seconds: float, *, speech: bool) -> list[InputAudioRawFrame]:
@@ -1070,6 +1101,70 @@ class TestLLMUserAggregator(unittest.IsolatedAsyncioTestCase):
         runs = [f for f in [*received_down, *received_up] if isinstance(f, LLMContextFrame)]
         self.assertEqual(len(runs), 1)
         self.assertIn(runs[0], received_down)
+
+    async def _run_held_result_after_earlier_inference(
+        self, inference: _TurnStopCommandFrame, finalize: _TurnStopCommandFrame
+    ) -> list[Frame]:
+        """Hold a result for a user still speaking after the turn's inference already ran.
+
+        Returns the frames that reached the top of the pipeline.
+        """
+        pair = LLMContextAggregatorPair(
+            LLMContext(),
+            user_params=LLMUserAggregatorParams(
+                user_turn_strategies=UserTurnStrategies(
+                    start=[VADUserTurnStartStrategy()],
+                    stop=[_ScriptedUserTurnStopStrategy()],
+                ),
+                user_mute_strategies=[FunctionCallUserMuteStrategy()],
+            ),
+        )
+        user_aggregator, assistant_aggregator = pair.user(), pair.assistant()
+
+        frames_to_send = [
+            VADUserStartedSpeakingFrame(),
+            TranscriptionFrame(text="Check my order", user_id="cat", timestamp=""),
+            SleepFrame(),
+            inference,
+            SleepFrame(),
+            # The response to that inference calls a function while the user
+            # keeps speaking, so its result is held for the turn to end.
+            LLMFullResponseStartFrame(),
+            self._function_calls_started(),
+            self._function_call_in_progress(),
+            LLMFullResponseEndFrame(),
+            SleepFrame(),
+            self._function_call_result(),
+            SleepFrame(),
+            VADUserStoppedSpeakingFrame(),
+            SleepFrame(),
+            finalize,
+            SleepFrame(sleep=0.5),
+        ]
+        _, received_up = await run_test(
+            Pipeline([user_aggregator, assistant_aggregator]),
+            frames_to_send=frames_to_send,
+            expected_down_frames=None,
+            expected_up_frames=None,
+        )
+        return received_up
+
+    async def test_held_result_runs_when_turn_ends_after_mid_turn_inference(self):
+        """A turn whose inference ran mid-turn brings no run at its end, so the held result runs."""
+        received_up = await self._run_held_result_after_earlier_inference(
+            _TurnStopCommandFrame(action="inference"), _TurnStopCommandFrame(action="finalize")
+        )
+        runs = [f for f in received_up if isinstance(f, LLMContextFrame)]
+        self.assertEqual(len(runs), 1)
+
+    async def test_held_result_runs_when_turn_end_confirms_speculation(self):
+        """A turn end that confirms a speculation brings no run, so the held result runs."""
+        received_up = await self._run_held_result_after_earlier_inference(
+            _TurnStopCommandFrame(action="speculate", text="Check my order"),
+            _TurnStopCommandFrame(action="confirm"),
+        )
+        runs = [f for f in received_up if isinstance(f, LLMContextFrame)]
+        self.assertEqual(len(runs), 1)
 
     async def test_pending_transcription_emitted_on_end_frame(self):
         """Pending user transcription should be emitted when EndFrame arrives."""

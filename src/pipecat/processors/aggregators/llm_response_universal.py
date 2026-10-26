@@ -132,7 +132,7 @@ _USER_SPEAKING_FRAME_PAIRS: tuple[tuple[type[Frame], type[Frame]], ...] = (
 
 @dataclass
 class _UserTurnEndedWithoutRunFrame(ControlFrame):
-    """Pair-internal: a user turn ended without running the LLM.
+    """Pair-internal: a user turn ended with no LLM run since the last function call result.
 
     Pushed downstream by :class:`LLMUserAggregator` after the turn's
     ``UserStoppedSpeakingFrame``, and consumed by :class:`LLMAssistantAggregator`,
@@ -725,6 +725,9 @@ class LLMUserAggregator(LLMContextAggregator):
             self._disable_empty_user_turn_recovery()
 
         self._user_is_muted = False
+        # Whether this aggregator ran the LLM since the last function call
+        # result. Speculative runs don't count: their context is a snapshot.
+        self._ran_llm_since_function_call_result = True
         # Stop frame classes whose matching start was let through unmuted.
         self._unmuted_speaking_starts: set[type[Frame]] = set()
         self._user_turn_start_timestamp = ""
@@ -844,6 +847,9 @@ class LLMUserAggregator(LLMContextAggregator):
         if await self._maybe_mute_frame(frame):
             return
 
+        if isinstance(frame, FunctionCallResultFrame):
+            self._ran_llm_since_function_call_result = False
+
         if isinstance(frame, StartFrame):
             await self.push_frame(frame, direction)
             await self._start(frame)
@@ -914,6 +920,15 @@ class LLMUserAggregator(LLMContextAggregator):
         await self._user_turn_controller.process_frame(frame)
 
         await self._user_idle_controller.process_frame(frame)
+
+    async def push_context_frame(self, direction: FrameDirection = FrameDirection.DOWNSTREAM):
+        """Push a context frame that runs the LLM.
+
+        Args:
+            direction: The direction to push the frame (upstream or downstream).
+        """
+        self._ran_llm_since_function_call_result = True
+        await super().push_context_frame(direction)
 
     async def push_aggregation(self) -> str:
         """Push the current aggregation."""
@@ -1553,7 +1568,13 @@ class LLMUserAggregator(LLMContextAggregator):
             # this turn's start cancelled.
             if not await self._maybe_recover_empty_user_turn(interrupted_bot):
                 await self._user_idle_controller.wait_for_user()
-                await self.push_frame(_UserTurnEndedWithoutRunFrame())
+
+        # A function call result held for the user to stop speaking rides the
+        # next run. Without one since the result (the turn was empty, or its
+        # inference ran mid-turn or speculatively), the assistant makes it.
+        if not on_session_end and not self._ran_llm_since_function_call_result:
+            self._ran_llm_since_function_call_result = True
+            await self.push_frame(_UserTurnEndedWithoutRunFrame())
 
     async def _maybe_recover_empty_user_turn(self, interrupted_bot: bool) -> bool:
         """Run the LLM for a user turn that ended with no transcript.
@@ -1689,8 +1710,9 @@ class LLMAssistantAggregator(LLMContextAggregator):
         # it was held for results still queued, or for a user who is speaking. Whichever
         # result is handled once the way is clear makes the push, whatever its own
         # `run_llm` says. A run that starts meanwhile, such as the one the user's turn
-        # brings, settles it: that run sees the context as it stands. A user turn with
-        # nothing in it brings no run, so the push is made when that turn ends.
+        # brings, settles it: that run sees the context as it stands. A user turn that
+        # ends without the user aggregator running the LLM since the result leaves the
+        # push to be made when that turn ends.
         self._context_push_owed: bool = False
 
         self._assistant_turn_start_timestamp = ""
