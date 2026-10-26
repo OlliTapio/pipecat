@@ -12,6 +12,7 @@ from loguru import logger
 
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import AdapterType, ToolsSchema
+from pipecat.audio.vad.vad_analyzer import VADAnalyzer, VADParams, VADState
 from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
@@ -22,6 +23,7 @@ from pipecat.frames.frames import (
     FunctionCallResultFrame,
     FunctionCallResultProperties,
     FunctionCallsStartedFrame,
+    InputAudioRawFrame,
     InterimTranscriptionFrame,
     InterruptionFrame,
     LLMAssistantPushAggregationFrame,
@@ -74,6 +76,7 @@ from pipecat.processors.aggregators.llm_response_universal import (
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.tests.utils import SleepFrame, run_test
+from pipecat.turns.empty_user_turn import EmptyUserTurnConfig
 from pipecat.turns.user_mute import (
     FirstSpeechUserMuteStrategy,
     FunctionCallUserMuteStrategy,
@@ -97,6 +100,33 @@ from pipecat.utils.text.base_text_aggregator import AggregationType
 
 USER_TURN_STOP_TIMEOUT = 0.2
 TRANSCRIPTION_TIMEOUT = 0.1
+
+VAD_SAMPLE_RATE = 16000
+VAD_FRAME_SAMPLES = VAD_SAMPLE_RATE // 50
+
+
+class _NonZeroVADAnalyzer(VADAnalyzer):
+    """VAD analyzer that hears voice in any frame that isn't all zeros."""
+
+    async def analyze_audio(self, buffer: bytes) -> VADState:
+        # Inline rather than on the analyzer's executor, to keep frame order.
+        return self._run_analyzer(buffer)
+
+    def num_frames_required(self) -> int:
+        return VAD_FRAME_SAMPLES
+
+    def voice_confidence(self, buffer: bytes) -> float:
+        return 1.0 if any(buffer) else 0.0
+
+
+def _audio_frames(seconds: float, *, speech: bool) -> list[InputAudioRawFrame]:
+    sample = b"\x00\x10" if speech else b"\x00\x00"
+    return [
+        InputAudioRawFrame(
+            audio=sample * VAD_FRAME_SAMPLES, sample_rate=VAD_SAMPLE_RATE, num_channels=1
+        )
+        for _ in range(int(seconds * 50))
+    ]
 
 
 class TestLLMUserAggregator(unittest.IsolatedAsyncioTestCase):
@@ -774,13 +804,109 @@ class TestLLMUserAggregator(unittest.IsolatedAsyncioTestCase):
         # The user mute strategies should have muted the user.
         self.assertFalse(user_turn)
 
+    def _function_calls_started(self) -> FunctionCallsStartedFrame:
+        return FunctionCallsStartedFrame(
+            function_calls=[
+                FunctionCallFromLLM(
+                    function_name="fn_1", tool_call_id="1", arguments={}, context=None
+                )
+            ]
+        )
+
+    def _function_call_in_progress(self) -> FunctionCallInProgressFrame:
+        return FunctionCallInProgressFrame(
+            function_name="fn_1", tool_call_id="1", arguments={}, cancel_on_interruption=False
+        )
+
+    def _function_call_result(self) -> FunctionCallResultFrame:
+        return FunctionCallResultFrame(
+            function_name="fn_1", tool_call_id="1", arguments={}, result={"ok": True}
+        )
+
+    # Each start/stop pair a mute tracks, with the frame type that shows the
+    # stop downstream: a proposed stop is resolved into a UserStoppedSpeakingFrame.
+    _SPEAKING_PAIRS = [
+        (VADUserStartedSpeakingFrame, VADUserStoppedSpeakingFrame, VADUserStoppedSpeakingFrame),
+        (UserStartedSpeakingFrame, UserStoppedSpeakingFrame, UserStoppedSpeakingFrame),
+        (
+            ProposedUserStartedSpeakingFrame,
+            ProposedUserStoppedSpeakingFrame,
+            UserStoppedSpeakingFrame,
+        ),
+    ]
+
+    async def test_user_mute_lets_stop_through_after_unmuted_start(self):
+        """A stop arriving while muted passes when its start got through unmuted."""
+        for start_cls, stop_cls, observed_stop_cls in self._SPEAKING_PAIRS:
+            with self.subTest(pair=start_cls.__name__):
+                user_aggregator = LLMUserAggregator(
+                    LLMContext(),
+                    params=LLMUserAggregatorParams(
+                        user_turn_strategies=ExternalUserTurnStrategies(),
+                        user_mute_strategies=[FunctionCallUserMuteStrategy()],
+                        # A proposed stop holds the turn for a transcript the
+                        # mute drops, so the stop timeout ends it.
+                        user_turn_stop_timeout=USER_TURN_STOP_TIMEOUT,
+                    ),
+                )
+                frames_to_send = [
+                    start_cls(),
+                    SleepFrame(),
+                    self._function_calls_started(),
+                    SleepFrame(),
+                    stop_cls(),
+                    SleepFrame(sleep=USER_TURN_STOP_TIMEOUT + 0.2),
+                ]
+                received_down, _ = await run_test(
+                    Pipeline([user_aggregator]),
+                    frames_to_send=frames_to_send,
+                    expected_down_frames=None,
+                )
+                self.assertTrue(any(isinstance(f, observed_stop_cls) for f in received_down))
+
+    async def test_user_mute_suppresses_pair_inside_mute(self):
+        """A start/stop pair that arrives entirely while muted stays suppressed."""
+        for start_cls, stop_cls, _ in self._SPEAKING_PAIRS:
+            with self.subTest(pair=start_cls.__name__):
+                user_aggregator = LLMUserAggregator(
+                    LLMContext(),
+                    params=LLMUserAggregatorParams(
+                        user_turn_strategies=ExternalUserTurnStrategies(),
+                        user_mute_strategies=[FunctionCallUserMuteStrategy()],
+                    ),
+                )
+                frames_to_send = [
+                    self._function_calls_started(),
+                    SleepFrame(),
+                    start_cls(),
+                    SleepFrame(),
+                    stop_cls(),
+                    SleepFrame(),
+                ]
+                received_down, _ = await run_test(
+                    Pipeline([user_aggregator]),
+                    frames_to_send=frames_to_send,
+                    expected_down_frames=None,
+                )
+                speaking = (
+                    VADUserStartedSpeakingFrame,
+                    VADUserStoppedSpeakingFrame,
+                    UserStartedSpeakingFrame,
+                    UserStoppedSpeakingFrame,
+                    ProposedUserStartedSpeakingFrame,
+                    ProposedUserStoppedSpeakingFrame,
+                )
+                self.assertFalse(any(isinstance(f, speaking) for f in received_down))
+
     async def test_user_mute_lets_vad_stop_through_after_unmuted_start(self):
         """A VAD stop arriving while muted still ends a turn its unmuted start opened."""
-        context = LLMContext()
         user_aggregator = LLMUserAggregator(
-            context,
+            LLMContext(),
             params=LLMUserAggregatorParams(
                 user_mute_strategies=[FunctionCallUserMuteStrategy()],
+                # The mute drops the transcript the default stop strategy waits
+                # for, so the turn ends through the stop timeout. A short one
+                # stands in for the default.
                 user_turn_stop_timeout=0.3,
             ),
         )
@@ -788,13 +914,7 @@ class TestLLMUserAggregator(unittest.IsolatedAsyncioTestCase):
         frames_to_send = [
             VADUserStartedSpeakingFrame(),
             SleepFrame(),
-            FunctionCallsStartedFrame(
-                function_calls=[
-                    FunctionCallFromLLM(
-                        function_name="fn_1", tool_call_id="1", arguments={}, context=None
-                    )
-                ]
-            ),
+            self._function_calls_started(),
             SleepFrame(),
             VADUserStoppedSpeakingFrame(),
             SleepFrame(sleep=0.6),
@@ -808,33 +928,30 @@ class TestLLMUserAggregator(unittest.IsolatedAsyncioTestCase):
         self.assertIn("VADUserStoppedSpeakingFrame", names)
         self.assertIn("UserStoppedSpeakingFrame", names)
 
-    async def test_user_mute_lets_user_stopped_through_after_unmuted_start(self):
-        """A turn stop arriving while muted still closes a turn its unmuted start opened."""
-        context = LLMContext()
+    async def test_user_mute_ends_turn_at_audio_idle_with_aggregator_vad(self):
+        """With aggregator-owned VAD, the audio idle timeout stops speech the mute hides."""
         user_aggregator = LLMUserAggregator(
-            context,
+            LLMContext(),
             params=LLMUserAggregatorParams(
-                user_turn_strategies=ExternalUserTurnStrategies(),
+                vad_analyzer=_NonZeroVADAnalyzer(
+                    params=VADParams(start_secs=0.1, stop_secs=0.2, min_volume=0.0)
+                ),
+                audio_idle_timeout=0.3,
                 user_mute_strategies=[FunctionCallUserMuteStrategy()],
+                # Stands in for the default stop timeout, as above.
+                user_turn_stop_timeout=0.3,
             ),
         )
 
         frames_to_send = [
-            UserStartedSpeakingFrame(),
+            *_audio_frames(0.3, speech=True),
+            SleepFrame(sleep=0.1),
+            self._function_calls_started(),
             SleepFrame(),
-            FunctionCallsStartedFrame(
-                function_calls=[
-                    FunctionCallFromLLM(
-                        function_name="fn_1", tool_call_id="1", arguments={}, context=None
-                    )
-                ]
-            ),
-            SleepFrame(),
-            UserStoppedSpeakingFrame(),
-            # Muted with no start let through, so this pair stays suppressed.
-            UserStartedSpeakingFrame(),
-            UserStoppedSpeakingFrame(),
-            SleepFrame(),
+            # Muted, so the VAD never sees this audio and its silence.
+            *_audio_frames(0.3, speech=True),
+            *_audio_frames(0.3, speech=False),
+            SleepFrame(sleep=1.0),
         ]
         received_down, _ = await run_test(
             Pipeline([user_aggregator]),
@@ -842,16 +959,17 @@ class TestLLMUserAggregator(unittest.IsolatedAsyncioTestCase):
             expected_down_frames=None,
         )
         names = [type(f).__name__ for f in received_down]
-        self.assertEqual(names.count("UserStartedSpeakingFrame"), 1)
+        self.assertEqual(names.count("VADUserStartedSpeakingFrame"), 1)
+        self.assertEqual(names.count("VADUserStoppedSpeakingFrame"), 1)
         self.assertEqual(names.count("UserStoppedSpeakingFrame"), 1)
 
     async def test_function_call_result_runs_llm_when_vad_stop_arrives_muted(self):
         """The assistant isn't left waiting on a user turn whose end arrived while muted."""
-        context = LLMContext()
         pair = LLMContextAggregatorPair(
-            context,
+            LLMContext(),
             user_params=LLMUserAggregatorParams(
                 user_mute_strategies=[FunctionCallUserMuteStrategy()],
+                # Stands in for the default stop timeout, as above.
                 user_turn_stop_timeout=0.3,
             ),
         )
@@ -862,34 +980,96 @@ class TestLLMUserAggregator(unittest.IsolatedAsyncioTestCase):
         frames_to_send = [
             VADUserStartedSpeakingFrame(),
             SleepFrame(),
-            FunctionCallsStartedFrame(
-                function_calls=[
-                    FunctionCallFromLLM(
-                        function_name="fn_1", tool_call_id="1", arguments={}, context=None
-                    )
-                ]
-            ),
-            FunctionCallInProgressFrame(
-                function_name="fn_1",
-                tool_call_id="1",
-                arguments={},
-                cancel_on_interruption=False,
-            ),
+            self._function_calls_started(),
+            self._function_call_in_progress(),
             SleepFrame(),
             VADUserStoppedSpeakingFrame(),
             SleepFrame(sleep=0.6),
-            FunctionCallResultFrame(
-                function_name="fn_1", tool_call_id="1", arguments={}, result={"ok": True}
-            ),
+            self._function_call_result(),
             SleepFrame(),
         ]
-        _, received_up = await run_test(
+        received_down, received_up = await run_test(
             Pipeline([user_aggregator, assistant_aggregator]),
             frames_to_send=frames_to_send,
             expected_down_frames=None,
             expected_up_frames=None,
         )
-        self.assertTrue(any(isinstance(f, LLMContextFrame) for f in received_up))
+        runs = [f for f in [*received_down, *received_up] if isinstance(f, LLMContextFrame)]
+        self.assertEqual(len(runs), 1)
+
+    async def test_function_call_result_during_empty_user_turn_runs_llm_at_turn_end(self):
+        """A result held for a speaking user runs the LLM once the user's empty turn ends."""
+        # Without recovery, the assistant aggregator makes the push it held. With
+        # it, the recovery's run carries the result instead.
+        for empty_user_turn in (None, EmptyUserTurnConfig()):
+            with self.subTest(empty_user_turn=empty_user_turn):
+                pair = LLMContextAggregatorPair(
+                    LLMContext(),
+                    user_params=LLMUserAggregatorParams(
+                        user_mute_strategies=[FunctionCallUserMuteStrategy()],
+                        empty_user_turn=empty_user_turn,
+                        # Stands in for the default stop timeout, as above.
+                        user_turn_stop_timeout=0.3,
+                    ),
+                )
+                user_aggregator, assistant_aggregator = pair.user(), pair.assistant()
+
+                frames_to_send = [
+                    VADUserStartedSpeakingFrame(),
+                    SleepFrame(),
+                    self._function_calls_started(),
+                    self._function_call_in_progress(),
+                    SleepFrame(),
+                    VADUserStoppedSpeakingFrame(),
+                    # The result arrives while the turn is still open.
+                    SleepFrame(sleep=0.1),
+                    self._function_call_result(),
+                    SleepFrame(sleep=0.6),
+                ]
+                received_down, received_up = await run_test(
+                    Pipeline([user_aggregator, assistant_aggregator]),
+                    frames_to_send=frames_to_send,
+                    expected_down_frames=None,
+                    expected_up_frames=None,
+                )
+                runs_down = [f for f in received_down if isinstance(f, LLMContextFrame)]
+                runs_up = [f for f in received_up if isinstance(f, LLMContextFrame)]
+                self.assertEqual(len(runs_down) + len(runs_up), 1)
+                if empty_user_turn is None:
+                    self.assertEqual(len(runs_up), 1)
+
+    async def test_function_call_result_during_user_turn_with_transcript_runs_llm_once(self):
+        """A result held for a speaking user rides the run the user's turn brings."""
+        pair = LLMContextAggregatorPair(
+            LLMContext(),
+            user_params=LLMUserAggregatorParams(
+                user_mute_strategies=[FunctionCallUserMuteStrategy()],
+            ),
+        )
+        user_aggregator, assistant_aggregator = pair.user(), pair.assistant()
+
+        frames_to_send = [
+            VADUserStartedSpeakingFrame(),
+            TranscriptionFrame(text="Hello", user_id="cat", timestamp=""),
+            SleepFrame(),
+            self._function_calls_started(),
+            self._function_call_in_progress(),
+            SleepFrame(),
+            VADUserStoppedSpeakingFrame(),
+            # The result arrives while the turn is still open.
+            SleepFrame(sleep=0.1),
+            self._function_call_result(),
+            SleepFrame(sleep=1.0),
+        ]
+        received_down, received_up = await run_test(
+            Pipeline([user_aggregator, assistant_aggregator]),
+            frames_to_send=frames_to_send,
+            expected_down_frames=None,
+            expected_up_frames=None,
+        )
+        runs = [f for f in [*received_down, *received_up] if isinstance(f, LLMContextFrame)]
+        self.assertEqual(len(runs), 1)
+        self.assertIn(runs[0], received_down)
 
     async def test_pending_transcription_emitted_on_end_frame(self):
         """Pending user transcription should be emitted when EndFrame arrives."""

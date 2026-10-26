@@ -29,6 +29,7 @@ from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
     CancelFrame,
+    ControlFrame,
     EagerEndOfTurnCancelFrame,
     EagerTranscriptionFrame,
     EndFrame,
@@ -127,6 +128,16 @@ _USER_SPEAKING_FRAME_PAIRS: tuple[tuple[type[Frame], type[Frame]], ...] = (
     (UserStartedSpeakingFrame, UserStoppedSpeakingFrame),
     (ProposedUserStartedSpeakingFrame, ProposedUserStoppedSpeakingFrame),
 )
+
+
+@dataclass
+class _UserTurnEndedWithoutRunFrame(ControlFrame):
+    """Pair-internal: a user turn ended without running the LLM.
+
+    Pushed downstream by :class:`LLMUserAggregator` after the turn's
+    ``UserStoppedSpeakingFrame``, and consumed by :class:`LLMAssistantAggregator`,
+    which makes any context push it held for the user to finish speaking.
+    """
 
 
 @dataclass
@@ -1542,6 +1553,7 @@ class LLMUserAggregator(LLMContextAggregator):
             # this turn's start cancelled.
             if not await self._maybe_recover_empty_user_turn(interrupted_bot):
                 await self._user_idle_controller.wait_for_user()
+                await self.push_frame(_UserTurnEndedWithoutRunFrame())
 
     async def _maybe_recover_empty_user_turn(self, interrupted_bot: bool) -> bool:
         """Run the LLM for a user turn that ended with no transcript.
@@ -1678,7 +1690,7 @@ class LLMAssistantAggregator(LLMContextAggregator):
         # result is handled once the way is clear makes the push, whatever its own
         # `run_llm` says. A run that starts meanwhile, such as the one the user's turn
         # brings, settles it: that run sees the context as it stands. A user turn with
-        # nothing in it brings no run, so the push stays owed until the next arrival.
+        # nothing in it brings no run, so the push is made when that turn ends.
         self._context_push_owed: bool = False
 
         self._assistant_turn_start_timestamp = ""
@@ -1836,6 +1848,11 @@ class LLMAssistantAggregator(LLMContextAggregator):
         elif isinstance(frame, UserStoppedSpeakingFrame):
             self._user_speaking = False
             await self.push_frame(frame, direction)
+        elif isinstance(frame, _UserTurnEndedWithoutRunFrame):
+            # A turn that brings a run settles an owed push when its response
+            # starts; one that doesn't leaves the push to be made here.
+            if self._context_push_owed and not self._user_speaking:
+                await self._maybe_push_context()
         elif isinstance(frame, BotStartedSpeakingFrame):
             self._bot_speaking = True
             await self.push_frame(frame, direction)
