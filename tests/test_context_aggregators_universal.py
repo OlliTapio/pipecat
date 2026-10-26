@@ -22,6 +22,7 @@ from pipecat.frames.frames import (
     FunctionCallResultFrame,
     FunctionCallResultProperties,
     FunctionCallsStartedFrame,
+    InputAudioRawFrame,
     InterimTranscriptionFrame,
     InterruptionFrame,
     LLMAssistantPushAggregationFrame,
@@ -961,7 +962,7 @@ class TestLLMUserAggregator(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(strategy, SpeechTimeoutUserTurnStopStrategy)
         self.assertEqual(content, "Hello!")
         self.assertIn({"role": "user", "content": "Hello!"}, context.get_messages())
-        self.assertFalse(any(isinstance(f, LLMContextFrame) for f in received_down))
+        self.assertEqual(sum(isinstance(f, LLMContextFrame) for f in received_down), 1)
 
     async def test_proposed_turn_open_before_the_mute_keeps_its_transcript(self):
         context = LLMContext()
@@ -1009,7 +1010,7 @@ class TestLLMUserAggregator(unittest.IsolatedAsyncioTestCase):
         strategy, content = stops[0]
         self.assertIsInstance(strategy, ExternalUserTurnStopStrategy)
         self.assertEqual(content, "Hello!")
-        self.assertFalse(any(isinstance(f, LLMContextFrame) for f in received_down))
+        self.assertEqual(sum(isinstance(f, LLMContextFrame) for f in received_down), 1)
 
     async def test_speech_started_while_muted_stays_muted(self):
         context = LLMContext()
@@ -1114,6 +1115,107 @@ class TestLLMUserAggregator(unittest.IsolatedAsyncioTestCase):
         stopped_frames = [f for f in received_down if isinstance(f, VADUserStoppedSpeakingFrame)]
         self.assertEqual(len(stopped_frames), 1)
         self.assertEqual(len([s for s, _ in stops if s is not None]), 1)
+
+    async def test_vad_stop_during_a_mute_ends_speech_before_its_turn_opens(self):
+        context = LLMContext()
+
+        user_aggregator = LLMUserAggregator(
+            context,
+            params=LLMUserAggregatorParams(
+                user_mute_strategies=[FunctionCallUserMuteStrategy()],
+                user_turn_strategies=UserTurnStrategies(
+                    start=[TranscriptionUserTurnStartStrategy()],
+                    stop=[
+                        SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=TRANSCRIPTION_TIMEOUT)
+                    ],
+                ),
+            ),
+        )
+
+        stops = []
+
+        @user_aggregator.event_handler("on_user_turn_stopped")
+        async def on_user_turn_stopped(aggregator, strategy, message):
+            stops.append((strategy, message.content))
+
+        pipeline = Pipeline([user_aggregator])
+
+        frames_to_send = [
+            VADUserStartedSpeakingFrame(),
+            SleepFrame(),
+            FunctionCallsStartedFrame(
+                function_calls=[
+                    FunctionCallFromLLM(
+                        function_name="fn_1", tool_call_id="1", arguments={}, context=None
+                    )
+                ]
+            ),
+            SleepFrame(),
+            VADUserStoppedSpeakingFrame(),
+            FunctionCallResultFrame(
+                function_name="fn_1", tool_call_id="1", arguments={}, result={}
+            ),
+            SleepFrame(),
+            TranscriptionFrame(text="Hello!", user_id="", timestamp="now"),
+            SleepFrame(sleep=TRANSCRIPTION_TIMEOUT + 0.2),
+        ]
+        await run_test(pipeline, frames_to_send=frames_to_send, expected_down_frames=None)
+
+        self.assertEqual(len(stops), 1)
+        strategy, content = stops[0]
+        self.assertIsInstance(strategy, SpeechTimeoutUserTurnStopStrategy)
+        self.assertEqual(content, "Hello!")
+
+    async def test_audio_stays_muted_while_the_open_turn_finishes(self):
+        context = LLMContext()
+
+        user_aggregator = LLMUserAggregator(
+            context,
+            params=LLMUserAggregatorParams(
+                user_mute_strategies=[FunctionCallUserMuteStrategy()],
+                user_turn_strategies=UserTurnStrategies(
+                    stop=[
+                        SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=TRANSCRIPTION_TIMEOUT)
+                    ]
+                ),
+            ),
+        )
+
+        stops = []
+
+        @user_aggregator.event_handler("on_user_turn_stopped")
+        async def on_user_turn_stopped(aggregator, strategy, message):
+            stops.append((strategy, message.content))
+
+        pipeline = Pipeline([user_aggregator])
+
+        frames_to_send = [
+            VADUserStartedSpeakingFrame(),
+            SleepFrame(),
+            FunctionCallsStartedFrame(
+                function_calls=[
+                    FunctionCallFromLLM(
+                        function_name="fn_1", tool_call_id="1", arguments={}, context=None
+                    )
+                ]
+            ),
+            SleepFrame(),
+            InputAudioRawFrame(audio=b"\x00\x00" * 160, sample_rate=16000, num_channels=1),
+            VADUserStoppedSpeakingFrame(),
+            TranscriptionFrame(text="Hello!", user_id="", timestamp="now"),
+            SleepFrame(sleep=TRANSCRIPTION_TIMEOUT + 0.2),
+            FunctionCallResultFrame(
+                function_name="fn_1", tool_call_id="1", arguments={}, result={}
+            ),
+            SleepFrame(),
+        ]
+        received_down, _ = await run_test(
+            pipeline, frames_to_send=frames_to_send, expected_down_frames=None
+        )
+
+        self.assertFalse(any(isinstance(f, InputAudioRawFrame) for f in received_down))
+        self.assertEqual(len(stops), 1)
+        self.assertEqual(stops[0][1], "Hello!")
 
     async def test_pending_transcription_emitted_on_end_frame(self):
         """Pending user transcription should be emitted when EndFrame arrives."""

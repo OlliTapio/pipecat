@@ -122,6 +122,11 @@ class UserTurnController(BaseObject):
         """The currently active user turn strategies."""
         return self._user_turn_strategies
 
+    @property
+    def user_turn_in_progress(self) -> bool:
+        """Whether a user turn has started and not yet stopped."""
+        return self._user_turn
+
     async def setup(self, setup: FrameProcessorSetup):
         """Set up the controller.
 
