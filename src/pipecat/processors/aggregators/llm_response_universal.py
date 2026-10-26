@@ -1645,9 +1645,9 @@ class LLMAssistantAggregator(LLMContextAggregator):
         self._context_updated_tasks: set[asyncio.Task] = set()
 
         self._user_speaking: bool = False
-        # Whether the user was muted during their current turn. Nothing they say
-        # from then on reaches the context, so the turn won't bring a run that a
-        # held push could wait for.
+        # Whether the user was muted during their current turn. A user muted during
+        # their turn isn't waited for, for the rest of that turn, even once the mute
+        # ends: a held context push runs while they are still speaking.
         self._user_muted_during_turn: bool = False
         self._bot_speaking: bool = False
 
@@ -1829,10 +1829,13 @@ class LLMAssistantAggregator(LLMContextAggregator):
             self._user_muted_during_turn = False
             await self.push_frame(frame, direction)
         elif isinstance(frame, UserMuteStartedFrame):
-            # Stays set after the mute ends: the turn has still lost its input.
-            if self._user_speaking:
+            # Stays set until the turn ends, even once the mute does.
+            newly_muted = self._user_speaking and not self._user_muted_during_turn
+            if newly_muted:
                 self._user_muted_during_turn = True
             await self.push_frame(frame, direction)
+            if newly_muted and self._context_push_owed:
+                await self._maybe_push_context()
         elif isinstance(frame, BotStartedSpeakingFrame):
             self._bot_speaking = True
             await self.push_frame(frame, direction)
