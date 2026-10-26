@@ -7,7 +7,6 @@
 import io
 import json
 import unittest
-from dataclasses import dataclass
 
 from loguru import logger
 
@@ -46,7 +45,6 @@ from pipecat.frames.frames import (
     SpeechControlParamsFrame,
     StartFrame,
     STTMetadataFrame,
-    SystemFrame,
     TextFrame,
     TranscriptionFrame,
     TranslationFrame,
@@ -76,8 +74,6 @@ from pipecat.processors.aggregators.llm_response_universal import (
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.tests.utils import SleepFrame, run_test
-from pipecat.turns.empty_user_turn import EmptyUserTurnConfig
-from pipecat.turns.types import ProcessFrameResult, UserTurnSpeculation
 from pipecat.turns.user_mute import (
     FirstSpeechUserMuteStrategy,
     FunctionCallUserMuteStrategy,
@@ -89,7 +85,6 @@ from pipecat.turns.user_start import (
     VADUserTurnStartStrategy,
 )
 from pipecat.turns.user_stop import (
-    BaseUserTurnStopStrategy,
     ExternalUserTurnStopStrategy,
     SpeechTimeoutUserTurnStopStrategy,
 )
@@ -102,33 +97,6 @@ from pipecat.utils.text.base_text_aggregator import AggregationType
 
 USER_TURN_STOP_TIMEOUT = 0.2
 TRANSCRIPTION_TIMEOUT = 0.1
-
-
-@dataclass
-class _TurnStopCommandFrame(SystemFrame):
-    """Tells :class:`_ScriptedUserTurnStopStrategy` which turn stop event to fire."""
-
-    action: str
-    text: str = ""
-
-
-class _ScriptedUserTurnStopStrategy(BaseUserTurnStopStrategy):
-    """Stop strategy that fires the turn stop events a test asks for, when it asks."""
-
-    async def process_frame(self, frame: Frame) -> ProcessFrameResult:
-        if not isinstance(frame, _TurnStopCommandFrame):
-            return ProcessFrameResult.CONTINUE
-        if frame.action == "inference":
-            await self.trigger_user_turn_inference_triggered()
-        elif frame.action == "speculate":
-            await self.trigger_user_turn_inference_triggered(
-                speculation=UserTurnSpeculation(text=frame.text)
-            )
-        elif frame.action == "finalize":
-            await self.trigger_user_turn_finalized()
-        elif frame.action == "confirm":
-            await self.trigger_user_turn_finalized(confirms_speculation=True)
-        return ProcessFrameResult.CONTINUE
 
 
 class TestLLMUserAggregator(unittest.IsolatedAsyncioTestCase):
@@ -3260,166 +3228,94 @@ class TestRealtimeServiceModeAggregator(unittest.IsolatedAsyncioTestCase):
             assistant._require_paired_user_aggregator()
 
 
-class TestHeldFunctionCallResult(unittest.IsolatedAsyncioTestCase):
-    """A function call result held for a speaking user runs once the user's turn ends."""
+class TestFunctionCallResultForMutedUser(unittest.IsolatedAsyncioTestCase):
+    """A function call result isn't held for a user muted during their turn."""
 
-    def _function_calls_started(self) -> FunctionCallsStartedFrame:
-        return FunctionCallsStartedFrame(
-            function_calls=[
-                FunctionCallFromLLM(
-                    function_name="fn_1", tool_call_id="1", arguments={}, context=None
-                )
-            ]
-        )
-
-    def _function_call_in_progress(self) -> FunctionCallInProgressFrame:
-        return FunctionCallInProgressFrame(
-            function_name="fn_1", tool_call_id="1", arguments={}, cancel_on_interruption=False
-        )
+    def _function_call_frames(self) -> list[Frame]:
+        return [
+            FunctionCallsStartedFrame(
+                function_calls=[
+                    FunctionCallFromLLM(
+                        function_name="fn_1", tool_call_id="1", arguments={}, context=None
+                    )
+                ]
+            ),
+            FunctionCallInProgressFrame(
+                function_name="fn_1", tool_call_id="1", arguments={}, cancel_on_interruption=False
+            ),
+        ]
 
     def _function_call_result(self) -> FunctionCallResultFrame:
         return FunctionCallResultFrame(
             function_name="fn_1", tool_call_id="1", arguments={}, result={"ok": True}
         )
 
-    async def test_held_result_runs_when_empty_user_turn_ends(self):
-        """A result held for a speaking user runs the LLM once the user's empty turn ends."""
-        # Without recovery, the assistant aggregator makes the push it held. With
-        # it, the recovery's run carries the result instead.
-        for empty_user_turn in (None, EmptyUserTurnConfig()):
-            with self.subTest(empty_user_turn=empty_user_turn):
-                pair = LLMContextAggregatorPair(
-                    LLMContext(),
-                    user_params=LLMUserAggregatorParams(
-                        user_mute_strategies=[FunctionCallUserMuteStrategy()],
-                        empty_user_turn=empty_user_turn,
-                        # With no transcript, the default stop strategy ends the
-                        # turn at the stop timeout; this stands in for the default.
-                        user_turn_stop_timeout=0.3,
-                    ),
-                )
-                user_aggregator, assistant_aggregator = pair.user(), pair.assistant()
-
-                frames_to_send = [
-                    VADUserStartedSpeakingFrame(),
-                    SleepFrame(),
-                    self._function_calls_started(),
-                    self._function_call_in_progress(),
-                    SleepFrame(),
-                    # The result arrives while the user is still speaking.
-                    self._function_call_result(),
-                    SleepFrame(),
-                    VADUserStoppedSpeakingFrame(),
-                    SleepFrame(sleep=0.6),
-                ]
-                received_down, received_up = await run_test(
-                    Pipeline([user_aggregator, assistant_aggregator]),
-                    frames_to_send=frames_to_send,
-                    expected_down_frames=None,
-                    expected_up_frames=None,
-                )
-                runs_down = [f for f in received_down if isinstance(f, LLMContextFrame)]
-                runs_up = [f for f in received_up if isinstance(f, LLMContextFrame)]
-                self.assertEqual(len(runs_down) + len(runs_up), 1)
-                if empty_user_turn is None:
-                    self.assertEqual(len(runs_up), 1)
-
-    async def test_held_result_rides_the_run_the_user_turn_brings(self):
-        """A result held for a speaking user runs once, with the run the user's turn brings."""
+    async def _run_pair(
+        self, frames_to_send: list[Frame], *, mute: bool
+    ) -> tuple[list[Frame], list[Frame]]:
         pair = LLMContextAggregatorPair(
             LLMContext(),
             user_params=LLMUserAggregatorParams(
-                user_mute_strategies=[FunctionCallUserMuteStrategy()],
+                user_mute_strategies=[FunctionCallUserMuteStrategy()] if mute else [],
             ),
         )
-        user_aggregator, assistant_aggregator = pair.user(), pair.assistant()
+        return await run_test(
+            Pipeline([pair.user(), pair.assistant()]),
+            frames_to_send=frames_to_send,
+            expected_down_frames=None,
+            expected_up_frames=None,
+        )
 
+    async def test_result_runs_while_turn_muted_by_the_function_call_is_open(self):
+        """The result runs at once, though the turn the mute cut off never ends."""
+        frames_to_send = [
+            # The user starts speaking just before the function call mutes them.
+            VADUserStartedSpeakingFrame(),
+            SleepFrame(),
+            *self._function_call_frames(),
+            SleepFrame(),
+            self._function_call_result(),
+            SleepFrame(sleep=0.5),
+        ]
+        _, received_up = await self._run_pair(frames_to_send, mute=True)
+        runs = [f for f in received_up if isinstance(f, LLMContextFrame)]
+        self.assertEqual(len(runs), 1)
+
+    async def test_result_runs_when_bot_stops_while_turn_muted_by_the_function_call_is_open(self):
+        """A result deferred for the bot to finish speaking runs when it does."""
+        frames_to_send = [
+            VADUserStartedSpeakingFrame(),
+            SleepFrame(),
+            *self._function_call_frames(),
+            SleepFrame(),
+            # The bot says something like "one moment" while the call runs.
+            BotStartedSpeakingFrame(),
+            self._function_call_result(),
+            SleepFrame(sleep=0.3),
+            BotStoppedSpeakingFrame(),
+            SleepFrame(sleep=0.3),
+        ]
+        _, received_up = await self._run_pair(frames_to_send, mute=True)
+        runs = [f for f in received_up if isinstance(f, LLMContextFrame)]
+        self.assertEqual(len(runs), 1)
+
+    async def test_result_held_for_unmuted_speaking_user_rides_their_turn(self):
+        """Without a mute, the result waits for the user's turn and runs with it, once."""
         frames_to_send = [
             VADUserStartedSpeakingFrame(),
             TranscriptionFrame(text="Hello", user_id="cat", timestamp=""),
             SleepFrame(),
-            self._function_calls_started(),
-            self._function_call_in_progress(),
+            *self._function_call_frames(),
             SleepFrame(),
-            # The result arrives while the user is still speaking.
             self._function_call_result(),
             SleepFrame(),
             VADUserStoppedSpeakingFrame(),
             SleepFrame(sleep=1.0),
         ]
-        received_down, received_up = await run_test(
-            Pipeline([user_aggregator, assistant_aggregator]),
-            frames_to_send=frames_to_send,
-            expected_down_frames=None,
-            expected_up_frames=None,
-        )
+        received_down, received_up = await self._run_pair(frames_to_send, mute=False)
         runs = [f for f in [*received_down, *received_up] if isinstance(f, LLMContextFrame)]
         self.assertEqual(len(runs), 1)
         self.assertIn(runs[0], received_down)
-
-    async def _run_held_result_after_earlier_inference(
-        self, inference: _TurnStopCommandFrame, finalize: _TurnStopCommandFrame
-    ) -> list[Frame]:
-        """Hold a result for a user still speaking after the turn's inference already ran.
-
-        Returns the frames that reached the top of the pipeline.
-        """
-        pair = LLMContextAggregatorPair(
-            LLMContext(),
-            user_params=LLMUserAggregatorParams(
-                user_turn_strategies=UserTurnStrategies(
-                    start=[VADUserTurnStartStrategy()],
-                    stop=[_ScriptedUserTurnStopStrategy()],
-                ),
-                user_mute_strategies=[FunctionCallUserMuteStrategy()],
-            ),
-        )
-        user_aggregator, assistant_aggregator = pair.user(), pair.assistant()
-
-        frames_to_send = [
-            VADUserStartedSpeakingFrame(),
-            TranscriptionFrame(text="Check my order", user_id="cat", timestamp=""),
-            SleepFrame(),
-            inference,
-            SleepFrame(),
-            # The response to that inference calls a function while the user
-            # keeps speaking, so its result is held for the turn to end.
-            LLMFullResponseStartFrame(),
-            self._function_calls_started(),
-            self._function_call_in_progress(),
-            LLMFullResponseEndFrame(),
-            SleepFrame(),
-            self._function_call_result(),
-            SleepFrame(),
-            VADUserStoppedSpeakingFrame(),
-            SleepFrame(),
-            finalize,
-            SleepFrame(sleep=0.5),
-        ]
-        _, received_up = await run_test(
-            Pipeline([user_aggregator, assistant_aggregator]),
-            frames_to_send=frames_to_send,
-            expected_down_frames=None,
-            expected_up_frames=None,
-        )
-        return received_up
-
-    async def test_held_result_runs_when_turn_ends_after_mid_turn_inference(self):
-        """A turn whose inference ran mid-turn brings no run at its end, so the held result runs."""
-        received_up = await self._run_held_result_after_earlier_inference(
-            _TurnStopCommandFrame(action="inference"), _TurnStopCommandFrame(action="finalize")
-        )
-        runs = [f for f in received_up if isinstance(f, LLMContextFrame)]
-        self.assertEqual(len(runs), 1)
-
-    async def test_held_result_runs_when_turn_end_confirms_speculation(self):
-        """A turn end that confirms a speculation brings no run, so the held result runs."""
-        received_up = await self._run_held_result_after_earlier_inference(
-            _TurnStopCommandFrame(action="speculate", text="Check my order"),
-            _TurnStopCommandFrame(action="confirm"),
-        )
-        runs = [f for f in received_up if isinstance(f, LLMContextFrame)]
-        self.assertEqual(len(runs), 1)
 
 
 if __name__ == "__main__":
