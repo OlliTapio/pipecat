@@ -910,6 +910,211 @@ class TestLLMUserAggregator(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(strategy, ExternalUserTurnStopStrategy)
         self.assertEqual(content, "Hello!")
 
+    async def test_transcript_after_the_mute_completes_the_turn_open_before_it(self):
+        context = LLMContext()
+
+        user_aggregator = LLMUserAggregator(
+            context,
+            params=LLMUserAggregatorParams(
+                user_mute_strategies=[FunctionCallUserMuteStrategy()],
+                user_turn_strategies=UserTurnStrategies(
+                    stop=[
+                        SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=TRANSCRIPTION_TIMEOUT)
+                    ]
+                ),
+            ),
+        )
+
+        stops = []
+
+        @user_aggregator.event_handler("on_user_turn_stopped")
+        async def on_user_turn_stopped(aggregator, strategy, message):
+            stops.append((strategy, message.content))
+
+        pipeline = Pipeline([user_aggregator])
+
+        frames_to_send = [
+            VADUserStartedSpeakingFrame(),
+            SleepFrame(),
+            FunctionCallsStartedFrame(
+                function_calls=[
+                    FunctionCallFromLLM(
+                        function_name="fn_1", tool_call_id="1", arguments={}, context=None
+                    )
+                ]
+            ),
+            SleepFrame(),
+            VADUserStoppedSpeakingFrame(),
+            TranscriptionFrame(text="Hello!", user_id="", timestamp="now"),
+            SleepFrame(sleep=TRANSCRIPTION_TIMEOUT + 0.2),
+            FunctionCallResultFrame(
+                function_name="fn_1", tool_call_id="1", arguments={}, result={}
+            ),
+            SleepFrame(),
+        ]
+        received_down, _ = await run_test(
+            pipeline, frames_to_send=frames_to_send, expected_down_frames=None
+        )
+
+        self.assertEqual(len(stops), 1)
+        strategy, content = stops[0]
+        self.assertIsInstance(strategy, SpeechTimeoutUserTurnStopStrategy)
+        self.assertEqual(content, "Hello!")
+        self.assertIn({"role": "user", "content": "Hello!"}, context.get_messages())
+        self.assertFalse(any(isinstance(f, LLMContextFrame) for f in received_down))
+
+    async def test_proposed_turn_open_before_the_mute_keeps_its_transcript(self):
+        context = LLMContext()
+
+        user_aggregator = LLMUserAggregator(
+            context,
+            params=LLMUserAggregatorParams(
+                user_mute_strategies=[FunctionCallUserMuteStrategy()],
+                user_turn_strategies=ExternalUserTurnStrategies(),
+            ),
+        )
+
+        stops = []
+
+        @user_aggregator.event_handler("on_user_turn_stopped")
+        async def on_user_turn_stopped(aggregator, strategy, message):
+            stops.append((strategy, message.content))
+
+        pipeline = Pipeline([user_aggregator])
+
+        frames_to_send = [
+            ProposedUserStartedSpeakingFrame(),
+            SleepFrame(),
+            FunctionCallsStartedFrame(
+                function_calls=[
+                    FunctionCallFromLLM(
+                        function_name="fn_1", tool_call_id="1", arguments={}, context=None
+                    )
+                ]
+            ),
+            SleepFrame(),
+            TranscriptionFrame(text="Hello!", user_id="", timestamp="now"),
+            ProposedUserStoppedSpeakingFrame(),
+            SleepFrame(sleep=0.5),
+            FunctionCallResultFrame(
+                function_name="fn_1", tool_call_id="1", arguments={}, result={}
+            ),
+            SleepFrame(),
+        ]
+        received_down, _ = await run_test(
+            pipeline, frames_to_send=frames_to_send, expected_down_frames=None
+        )
+
+        self.assertEqual(len(stops), 1)
+        strategy, content = stops[0]
+        self.assertIsInstance(strategy, ExternalUserTurnStopStrategy)
+        self.assertEqual(content, "Hello!")
+        self.assertFalse(any(isinstance(f, LLMContextFrame) for f in received_down))
+
+    async def test_speech_started_while_muted_stays_muted(self):
+        context = LLMContext()
+
+        user_aggregator = LLMUserAggregator(
+            context,
+            params=LLMUserAggregatorParams(
+                user_mute_strategies=[FunctionCallUserMuteStrategy()],
+                user_turn_strategies=UserTurnStrategies(
+                    stop=[
+                        SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=TRANSCRIPTION_TIMEOUT)
+                    ]
+                ),
+            ),
+        )
+
+        stops = []
+
+        @user_aggregator.event_handler("on_user_turn_stopped")
+        async def on_user_turn_stopped(aggregator, strategy, message):
+            stops.append((strategy, message.content))
+
+        pipeline = Pipeline([user_aggregator])
+
+        frames_to_send = [
+            FunctionCallsStartedFrame(
+                function_calls=[
+                    FunctionCallFromLLM(
+                        function_name="fn_1", tool_call_id="1", arguments={}, context=None
+                    )
+                ]
+            ),
+            SleepFrame(),
+            VADUserStartedSpeakingFrame(),
+            TranscriptionFrame(text="Hello!", user_id="", timestamp="now"),
+            VADUserStoppedSpeakingFrame(),
+            SleepFrame(sleep=TRANSCRIPTION_TIMEOUT + 0.2),
+            FunctionCallResultFrame(
+                function_name="fn_1", tool_call_id="1", arguments={}, result={}
+            ),
+            SleepFrame(),
+        ]
+        received_down, _ = await run_test(
+            pipeline, frames_to_send=frames_to_send, expected_down_frames=None
+        )
+
+        self.assertFalse([s for s, _ in stops if s is not None])
+        self.assertFalse(
+            any(
+                isinstance(f, (VADUserStartedSpeakingFrame, VADUserStoppedSpeakingFrame))
+                for f in received_down
+            )
+        )
+
+    async def test_a_stray_stop_during_a_mute_stays_muted_after_its_turn_ended(self):
+        context = LLMContext()
+
+        user_aggregator = LLMUserAggregator(
+            context,
+            params=LLMUserAggregatorParams(
+                user_mute_strategies=[FunctionCallUserMuteStrategy()],
+                user_turn_strategies=UserTurnStrategies(
+                    stop=[
+                        SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=TRANSCRIPTION_TIMEOUT)
+                    ]
+                ),
+            ),
+        )
+
+        stops = []
+
+        @user_aggregator.event_handler("on_user_turn_stopped")
+        async def on_user_turn_stopped(aggregator, strategy, message):
+            stops.append((strategy, message.content))
+
+        pipeline = Pipeline([user_aggregator])
+
+        frames_to_send = [
+            VADUserStartedSpeakingFrame(),
+            TranscriptionFrame(text="Hello!", user_id="", timestamp="now"),
+            SleepFrame(),
+            VADUserStoppedSpeakingFrame(),
+            SleepFrame(sleep=TRANSCRIPTION_TIMEOUT + 0.2),
+            FunctionCallsStartedFrame(
+                function_calls=[
+                    FunctionCallFromLLM(
+                        function_name="fn_1", tool_call_id="1", arguments={}, context=None
+                    )
+                ]
+            ),
+            SleepFrame(),
+            VADUserStoppedSpeakingFrame(),
+            FunctionCallResultFrame(
+                function_name="fn_1", tool_call_id="1", arguments={}, result={}
+            ),
+            SleepFrame(),
+        ]
+        received_down, _ = await run_test(
+            pipeline, frames_to_send=frames_to_send, expected_down_frames=None
+        )
+
+        stopped_frames = [f for f in received_down if isinstance(f, VADUserStoppedSpeakingFrame)]
+        self.assertEqual(len(stopped_frames), 1)
+        self.assertEqual(len([s for s, _ in stops if s is not None]), 1)
+
     async def test_pending_transcription_emitted_on_end_frame(self):
         """Pending user transcription should be emitted when EndFrame arrives."""
         context = LLMContext()

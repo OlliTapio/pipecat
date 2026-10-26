@@ -713,6 +713,7 @@ class LLMUserAggregator(LLMContextAggregator):
 
         self._user_is_muted = False
         self._unmuted_speech_stops_owed: set[type[Frame]] = set()
+        self._user_turn_open = False
         self._user_turn_start_timestamp = ""
         # One-shot guard: whether the first realtime LLM service metadata frame
         # has been handled this session — see _handle_llm_service_metadata.
@@ -1221,21 +1222,27 @@ class LLMUserAggregator(LLMContextAggregator):
         if isinstance(frame, (StartFrame, EndFrame, CancelFrame)):
             return False
 
-        should_mute_frame = self._user_is_muted and isinstance(
-            frame,
-            (
-                InterruptionFrame,
-                VADUserStartedSpeakingFrame,
-                VADUserStoppedSpeakingFrame,
-                ProposedUserStartedSpeakingFrame,
-                ProposedUserStoppedSpeakingFrame,
-                UserStartedSpeakingFrame,
-                UserStoppedSpeakingFrame,
-                InputAudioRawFrame,
-                InterimTranscriptionFrame,
-                TranscriptionFrame,
-                EagerTranscriptionFrame,
-            ),
+        # A mute applies from the next turn: the open turn keeps its input, not interruptions.
+        should_mute_frame = self._user_is_muted and (
+            isinstance(frame, InterruptionFrame)
+            or (
+                not self._user_turn_open
+                and isinstance(
+                    frame,
+                    (
+                        VADUserStartedSpeakingFrame,
+                        VADUserStoppedSpeakingFrame,
+                        ProposedUserStartedSpeakingFrame,
+                        ProposedUserStoppedSpeakingFrame,
+                        UserStartedSpeakingFrame,
+                        UserStoppedSpeakingFrame,
+                        InputAudioRawFrame,
+                        InterimTranscriptionFrame,
+                        TranscriptionFrame,
+                        EagerTranscriptionFrame,
+                    ),
+                )
+            )
         )
 
         for start_type, stop_type in _SPEECH_START_STOP_PAIRS:
@@ -1356,6 +1363,10 @@ class LLMUserAggregator(LLMContextAggregator):
     async def _on_vad_speech_activity(self, controller):
         await self._queued_broadcast_frame(UserSpeakingFrame)
 
+    @property
+    def _awaits_function_result(self) -> bool:
+        return self._user_is_muted and bool(self._user_idle_controller.function_calls_in_progress)
+
     async def _on_user_turn_started(
         self,
         controller: UserTurnController,
@@ -1363,6 +1374,7 @@ class LLMUserAggregator(LLMContextAggregator):
         params: UserTurnStartedParams,
     ):
         logger.debug(f"{self}: User started speaking (strategy: {strategy})")
+        self._user_turn_open = True
 
         self._user_turn_start_timestamp = time_now_iso8601()
         self._full_user_turn_aggregation = None
@@ -1412,12 +1424,12 @@ class LLMUserAggregator(LLMContextAggregator):
         logger.debug(f"{self}: User turn inference triggered (strategy: {strategy})")
 
         # Push aggregation now: this writes the user message segment to
-        # the context and emits LLMContextFrame, which kicks LLM
-        # inference. Concatenate the segment into
-        # `_full_user_turn_aggregation` so multiple inferences in the
-        # same turn don't lose earlier segments from the eventual
-        # `on_user_turn_stopped` event.
-        segment = await self.push_aggregation()
+        # the context and, unless a pending function call result will run
+        # the LLM, emits LLMContextFrame, which kicks LLM inference.
+        # Concatenate the segment into `_full_user_turn_aggregation` so
+        # multiple inferences in the same turn don't lose earlier segments
+        # from the eventual `on_user_turn_stopped` event.
+        segment = await self._push_aggregation(run_llm=not self._awaits_function_result)
         if segment:
             if self._full_user_turn_aggregation:
                 self._full_user_turn_aggregation = (
@@ -1458,6 +1470,7 @@ class LLMUserAggregator(LLMContextAggregator):
         params: UserTurnStoppedParams,
     ):
         logger.debug(f"{self}: User stopped speaking (strategy: {strategy})")
+        self._user_turn_open = False
 
         if params.enable_user_speaking_frames:
             await self.broadcast_frame(UserStoppedSpeakingFrame)
@@ -1479,7 +1492,9 @@ class LLMUserAggregator(LLMContextAggregator):
         # A turn end that confirms a speculation has its response already: the
         # context write is all that's left, and running inference again would
         # answer the same turn twice.
-        await self._maybe_emit_user_turn_stopped(strategy, run_llm=not params.confirms_speculation)
+        await self._maybe_emit_user_turn_stopped(
+            strategy, run_llm=not params.confirms_speculation and not self._awaits_function_result
+        )
 
     async def _on_reset_aggregation(
         self, controller: UserTurnController, strategy: BaseUserTurnStartStrategy
